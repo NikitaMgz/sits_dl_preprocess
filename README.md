@@ -38,7 +38,6 @@ cd <repository-directory>
 - Pandas (`pandas`)
 - mmap-ninja (`mmap_ninja`)
 - Pyyaml (`yaml`)
-- Argparse (`argparse`)
 - Rich (`rich`) for progress tracking
 - tqdm for progress visualization
 

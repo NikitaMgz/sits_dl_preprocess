@@ -14,4 +14,5 @@ dependencies:
   - pyyaml
   - pip:
     - mmap-ninja
-    - earthengine-api 
+    - earthengine-api
+    - hydra-core

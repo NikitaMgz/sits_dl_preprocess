@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 import datetime
+import logging
 import multiprocessing
 import os
-from logging import Logger
 
 import geopandas as gpd
 import numpy as np
@@ -21,7 +21,7 @@ from rich.progress import (
 class DataProcessor:
     def __init__(
         self,
-        logger: Logger,
+        logger: logging.Logger,
         data: dict,
         radiometric_bands: list,
         all_bands: list,
@@ -102,14 +102,16 @@ class DataProcessor:
 
         return starts, ends
 
-    def process_dataframe(self, df: pd.DataFrame, parcel_id: int) -> np.ndarray:
+    def process_dataframe(
+        self, df: pd.DataFrame, parcel_id: int, parcel_index: int
+    ) -> np.ndarray:
         """
         Process the downloaded dataframe into the final array format.
 
         Args:
             df: DataFrame with raw satellite data
             parcel_id: Parcel ID
-
+            parcel_index: Index of the parcel in the original DataFrame
         Returns:
             numpy.ndarray: Processed array or None if processing failed
         """
@@ -170,7 +172,7 @@ class DataProcessor:
         ]
 
         # Add ID_RPG and convert types
-        df["ID_RPG"] = parcel_id
+        df["ID_RPG"] = parcel_index
         df = df.reset_index()
         df["ID_TS"] = df["ID_TS"].astype("int16")
         df["ID_RPG"] = df["ID_RPG"].astype("int32")
@@ -222,7 +224,9 @@ class DataProcessor:
             raw_df = self.ee_client.retrieve_data(region, row, self)
 
             # Process data
-            processed_array = self.process_dataframe(raw_df, int(index))
+            processed_array = self.process_dataframe(
+                raw_df, row["ID_PARCEL"], int(index)
+            )
             if processed_array is None:
                 self.logger.error(f"Processing failed for parcel {row['ID_PARCEL']}")
                 return False
@@ -235,17 +239,73 @@ class DataProcessor:
             self.logger.error(f"Error processing parcel {index}: {e}")
             return False
 
-    def worker_wrapper(self, args: tuple) -> bool:
+    class InfoOnlyFilter(logging.Filter):
+        def filter(self, record):
+            # Allow only INFO-level messages
+            import logging
+
+            return record.levelno == logging.INFO
+
+    def worker_wrapper(
+        self, queue: multiprocessing.Queue, results: multiprocessing.Queue
+    ):
         """
         Wrapper around download_and_process_worker that unpacks arguments for multiprocessing.
 
         Args:
-            args: Tuple of (index, row) from DataFrame.iterrows()
-
-        Returns:
-            bool: True if processing was successful, False otherwise
+            queue: Queue for passing tasks to workers
+            results: Queue for passing results back to the main process
         """
-        return self.download_and_process_worker(args)
+        import sys
+
+        # if the platform is Windows, we need to reconfigure the logger and reinitialize Earth Engine
+        if sys.platform == "win32":
+            import logging
+
+            import ee
+
+            # Reconfigure the logger in the worker process
+            logging.getLogger().setLevel(logging.ERROR)
+
+            # Configure module's logger
+            logging.basicConfig()
+            logger = logging.getLogger(__name__)
+            logger.setLevel(logging.INFO)
+
+            # Add handlers
+            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(formatter)
+            stream_handler.addFilter(self.InfoOnlyFilter())
+            logger.addHandler(stream_handler)
+
+            file_handler = logging.FileHandler("download_process.log")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+            # Remove previous basic config
+            for handler in logging.getLogger().handlers[:]:
+                logging.getLogger().removeHandler(handler)
+            self.logger = logging.getLogger(__name__)
+
+            # Ensure Earth Engine is initialized in the worker process
+            try:
+                ee.Initialize(
+                    opt_url="https://earthengine-highvolume.googleapis.com",
+                    project=self.ee_client.config["ee_project_name"],
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Earth Engine in worker: {e}")
+                return False
+        while True:
+            try:
+                # Get the next task from the queue
+                index, row = queue.get(timeout=5)
+            except multiprocessing.queues.Empty:
+                break
+            sucess = self.download_and_process_worker((index, row))
+            results.put(sucess)
 
     def process_parcels(self, df: gpd.GeoDataFrame, n_workers: int = 60) -> None:
         """
@@ -258,7 +318,28 @@ class DataProcessor:
         Returns:
             None
         """
-        pool = multiprocessing.Pool(n_workers)
+        # Create the queues for inter-process communication
+        queue = multiprocessing.Queue()
+        results = multiprocessing.Queue()
+        for index, row in df.iterrows():
+            queue.put((index, row))
+
+        self.logger.info(
+            f"Starting processing of {len(df)} parcels with {n_workers} workers"
+        )
+
+        # Create and start the worker processes
+        workers = []
+        for _ in range(n_workers):
+            worker = multiprocessing.Process(
+                target=self.worker_wrapper,
+                args=(
+                    queue,
+                    results,
+                ),
+            )
+            worker.start()
+            workers.append(worker)
 
         # Setup progress display
         progress = Progress(
@@ -270,33 +351,22 @@ class DataProcessor:
             TimeRemainingColumn(),
         )
 
-        self.logger.info(
-            f"Starting processing of {len(df)} parcels with {n_workers} workers"
-        )
-
-        # Use functools.partial to create a function with fixed arguments except the first one
-        import functools
-
-        worker_func = functools.partial(self.worker_wrapper)
-
         try:
             with progress:
                 task = progress.add_task("[cyan]Processing parcels...", total=len(df))
-                for result in pool.imap_unordered(worker_func, df.iterrows()):
-                    progress.update(task, advance=1)
-        except AttributeError as e:
-            if "'NoneType' object has no attribute 'dumps'" in str(e):
-                # This error occurs during Pool cleanup and can be safely ignored
-                self.logger.info("Ignoring Pool cleanup AttributeError")
-            else:
-                raise
+                completed_tasks = 0
+                while completed_tasks < len(df):
+                    result = results.get()
+                    if result is not None:
+                        completed_tasks += 1
+                        progress.update(task, completed=completed_tasks)
         except Exception as e:
             self.logger.error(f"Unexpected error during processing: {e}")
             raise
         finally:
             self.logger.info(f"Processing completed for {len(df)} parcels")
-            pool.close()
-            pool.join()
+            for worker in workers:
+                worker.join()
 
     def filter_by_area(
         self, df: gpd.GeoDataFrame, area_min: int, area_max: int
