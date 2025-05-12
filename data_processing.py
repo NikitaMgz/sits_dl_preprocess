@@ -4,6 +4,8 @@ import datetime
 import logging
 import multiprocessing
 import os
+import random
+import time
 
 import geopandas as gpd
 import numpy as np
@@ -246,9 +248,7 @@ class DataProcessor:
 
             return record.levelno == logging.INFO
 
-    def worker_wrapper(
-        self, queue: multiprocessing.Queue, results: multiprocessing.Queue
-    ):
+    def worker_wrapper(self, args):
         """
         Wrapper around download_and_process_worker that unpacks arguments for multiprocessing.
 
@@ -256,6 +256,9 @@ class DataProcessor:
             queue: Queue for passing tasks to workers
             results: Queue for passing results back to the main process
         """
+        return self.download_and_process_worker(args)
+
+    def init_worker(self):
         import sys
 
         # if the platform is Windows, we need to reconfigure the logger and reinitialize Earth Engine
@@ -296,16 +299,21 @@ class DataProcessor:
                     project=self.ee_client.config["ee_project_name"],
                 )
             except Exception as e:
-                self.logger.error(f"Failed to initialize Earth Engine in worker: {e}")
-                return False
-        while True:
-            try:
-                # Get the next task from the queue
-                index, row = queue.get(timeout=5)
-            except multiprocessing.queues.Empty:
-                break
-            sucess = self.download_and_process_worker((index, row))
-            results.put(sucess)
+                self.logger.error(
+                    f"Initial EE initialization failed, attempting authentication: {e}"
+                )
+                try:
+                    ee.Authenticate()
+                    ee.Initialize(
+                        opt_url="https://earthengine-highvolume.googleapis.com",
+                        project=self.ee_client.config["ee_project_name"],
+                    )
+                    self.logger.info("Earth Engine initialized after authentication")
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to initialize Earth Engine after authentication: {e}"
+                    )
+                    raise
 
     def process_parcels(self, df: gpd.GeoDataFrame, n_workers: int = 60) -> None:
         """
@@ -318,30 +326,11 @@ class DataProcessor:
         Returns:
             None
         """
-        # Create the queues for inter-process communication
-        queue = multiprocessing.Queue()
-        results = multiprocessing.Queue()
-        for index, row in df.iterrows():
-            queue.put((index, row))
-
-        self.logger.info(
-            f"Starting processing of {len(df)} parcels with {n_workers} workers"
-        )
-
-        # Create and start the worker processes
-        workers = []
-        for _ in range(n_workers):
-            worker = multiprocessing.Process(
-                target=self.worker_wrapper,
-                args=(
-                    queue,
-                    results,
-                ),
-            )
-            worker.start()
-            workers.append(worker)
-
-        # Setup progress display
+        try:
+            pool = multiprocessing.Pool(n_workers, initializer=self.init_worker)
+        except Exception as e:
+            self.logger.error(f"Failed to create multiprocessing pool: {e}")
+            raise
         progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -350,23 +339,25 @@ class DataProcessor:
             TaskProgressColumn(),
             TimeRemainingColumn(),
         )
+        self.logger.info(
+            f"Starting processing of {len(df)} parcels with {n_workers} workers"
+        )
+        # Use functools.partial to create a function with fixed arguments except the first one
+        import functools
 
+        worker_func = functools.partial(self.worker_wrapper)
         try:
             with progress:
                 task = progress.add_task("[cyan]Processing parcels...", total=len(df))
-                completed_tasks = 0
-                while completed_tasks < len(df):
-                    result = results.get()
-                    if result is not None:
-                        completed_tasks += 1
-                        progress.update(task, completed=completed_tasks)
+                for result in pool.imap_unordered(worker_func, df.iterrows()):
+                    progress.update(task, advance=1)
         except Exception as e:
             self.logger.error(f"Unexpected error during processing: {e}")
             raise
         finally:
             self.logger.info(f"Processing completed for {len(df)} parcels")
-            for worker in workers:
-                worker.join()
+            pool.close()
+            pool.join()
 
     def filter_by_area(
         self, df: gpd.GeoDataFrame, area_min: int, area_max: int
