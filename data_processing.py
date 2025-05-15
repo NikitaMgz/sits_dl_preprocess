@@ -238,15 +238,18 @@ class DataProcessor:
                 return True
 
         except Exception as e:
-            self.logger.warning(f"Error processing parcel {index}: {e}")
+            self.logger.error(f"Error processing parcel {index}: {e}")
             return False
 
-    class InfoOnlyFilter(logging.Filter):
+    class InfoAndErrorOnlyFilter(logging.Filter):
         def filter(self, record):
-            # Allow only INFO-level messages
+            # Allow only INFO and ERROR level messages
             import logging
 
-            return record.levelno == logging.INFO
+            return (
+                not record.levelno == logging.NOTSET
+                and not record.levelno == logging.WARNING
+            )
 
     def worker_wrapper(self, args):
         """
@@ -280,7 +283,7 @@ class DataProcessor:
 
             stream_handler = logging.StreamHandler()
             stream_handler.setFormatter(formatter)
-            stream_handler.addFilter(self.InfoOnlyFilter())
+            # stream_handler.addFilter(self.InfoAndErrorOnlyFilter())
             logger.addHandler(stream_handler)
 
             file_handler = logging.FileHandler("download_process.log")

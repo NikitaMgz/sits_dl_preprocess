@@ -49,12 +49,11 @@ def setup_logging(log_file: str = "download_process.log") -> logging.Logger:
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
-    stream_handler.addFilter(InfoOnlyFilter())
+    # stream_handler.addFilter(InfoOnlyFilter())
     logger.addHandler(stream_handler)
 
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.WARNING)
     logger.addHandler(file_handler)
 
     # Remove previous basic config
